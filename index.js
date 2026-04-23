@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 const FormData = require('form-data');
+const { google } = require('googleapis');
 const app = express();
 
 app.use(express.json());
@@ -20,6 +21,18 @@ const ISMAEL_NUMBER = process.env.ISMAEL_NUMBER || '34610870338';
 const conversaciones = {};
 const devSessions = {};
 const pendingApprovals = {};
+
+// ─── Google Auth ──────────────────────────────────────────────────────────────
+
+function getGoogleAuth() {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    'urn:ietf:wg:oauth:2.0:oob'
+  );
+  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+  return oauth2Client;
+}
 
 // ─── Audio ────────────────────────────────────────────────────────────────────
 
@@ -196,6 +209,89 @@ const CLAUDE_CODE_TOOLS = [
       },
       required: ['commit_message', 'files']
     }
+  },
+  {
+    name: 'gmail_buscar',
+    description: 'Busca emails en Gmail de Ismael',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Búsqueda Gmail, ej: "from:cliente@empresa.com" o "subject:factura"' },
+        max: { type: 'number', description: 'Máximo de resultados, por defecto 5' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'gmail_leer',
+    description: 'Lee el contenido completo de un email por su ID',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'ID del mensaje de Gmail' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'gmail_enviar',
+    description: 'Envía un email desde la cuenta de Ismael (pide confirmación)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Destinatario' },
+        subject: { type: 'string', description: 'Asunto' },
+        body: { type: 'string', description: 'Cuerpo del email' }
+      },
+      required: ['to', 'subject', 'body']
+    }
+  },
+  {
+    name: 'calendar_listar',
+    description: 'Lista los próximos eventos del calendario de Ismael',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dias: { type: 'number', description: 'Cuántos días hacia adelante mirar, por defecto 7' }
+      }
+    }
+  },
+  {
+    name: 'calendar_crear',
+    description: 'Crea un evento en el calendario de Ismael (pide confirmación)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        titulo: { type: 'string', description: 'Título del evento' },
+        inicio: { type: 'string', description: 'Fecha y hora de inicio en formato ISO, ej: 2026-04-25T10:00:00' },
+        fin: { type: 'string', description: 'Fecha y hora de fin en formato ISO' },
+        descripcion: { type: 'string', description: 'Descripción opcional' }
+      },
+      required: ['titulo', 'inicio', 'fin']
+    }
+  },
+  {
+    name: 'drive_buscar',
+    description: 'Busca archivos en Google Drive de Ismael',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Texto a buscar en el nombre del archivo' },
+        max: { type: 'number', description: 'Máximo de resultados, por defecto 5' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'drive_leer',
+    description: 'Lee el contenido de un archivo de Google Drive (documentos de texto)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'ID del archivo en Drive' }
+      },
+      required: ['id']
+    }
   }
 ];
 
@@ -297,6 +393,114 @@ async function ejecutarHerramienta(from, toolName, toolInput) {
       return `Push completado. Railway redesplegar en ~2 minutos.\n${results.join('\n')}`;
     }
 
+    // ── Google tools ──────────────────────────────────────────────────────────
+
+    if (toolName === 'gmail_buscar') {
+      const auth = getGoogleAuth();
+      const gmail = google.gmail({ version: 'v1', auth });
+      const res = await gmail.users.messages.list({
+        userId: 'me',
+        q: toolInput.query,
+        maxResults: toolInput.max || 5
+      });
+      if (!res.data.messages || res.data.messages.length === 0) return 'No se encontraron emails.';
+      const detalles = await Promise.all(res.data.messages.map(async m => {
+        const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'metadata', metadataHeaders: ['From', 'Subject', 'Date'] });
+        const headers = msg.data.payload.headers;
+        const get = name => headers.find(h => h.name === name)?.value || '';
+        return `ID: ${m.id}\nDe: ${get('From')}\nAsunto: ${get('Subject')}\nFecha: ${get('Date')}`;
+      }));
+      return detalles.join('\n\n');
+    }
+
+    if (toolName === 'gmail_leer') {
+      const auth = getGoogleAuth();
+      const gmail = google.gmail({ version: 'v1', auth });
+      const msg = await gmail.users.messages.get({ userId: 'me', id: toolInput.id, format: 'full' });
+      const headers = msg.data.payload.headers;
+      const get = name => headers.find(h => h.name === name)?.value || '';
+      let body = '';
+      const parts = msg.data.payload.parts || [msg.data.payload];
+      for (const part of parts) {
+        if (part.mimeType === 'text/plain' && part.body?.data) {
+          body = Buffer.from(part.body.data, 'base64').toString('utf8');
+          break;
+        }
+      }
+      return `De: ${get('From')}\nAsunto: ${get('Subject')}\nFecha: ${get('Date')}\n\n${body.slice(0, 2000)}`;
+    }
+
+    if (toolName === 'gmail_enviar') {
+      const auth = getGoogleAuth();
+      const gmail = google.gmail({ version: 'v1', auth });
+      const mensaje = [`To: ${toolInput.to}`, `Subject: ${toolInput.subject}`, 'Content-Type: text/plain; charset=utf-8', '', toolInput.body].join('\n');
+      const encoded = Buffer.from(mensaje).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded } });
+      return `✅ Email enviado a ${toolInput.to}`;
+    }
+
+    if (toolName === 'calendar_listar') {
+      const auth = getGoogleAuth();
+      const calendar = google.calendar({ version: 'v3', auth });
+      const ahora = new Date();
+      const fin = new Date();
+      fin.setDate(fin.getDate() + (toolInput.dias || 7));
+      const res = await calendar.events.list({
+        calendarId: 'primary',
+        timeMin: ahora.toISOString(),
+        timeMax: fin.toISOString(),
+        singleEvents: true,
+        orderBy: 'startTime',
+        maxResults: 10
+      });
+      if (!res.data.items || res.data.items.length === 0) return 'No hay eventos próximos.';
+      return res.data.items.map(e => {
+        const start = e.start.dateTime || e.start.date;
+        return `📅 ${e.summary}\n   ${start}${e.location ? '\n   📍 ' + e.location : ''}`;
+      }).join('\n\n');
+    }
+
+    if (toolName === 'calendar_crear') {
+      const auth = getGoogleAuth();
+      const calendar = google.calendar({ version: 'v3', auth });
+      await calendar.events.insert({
+        calendarId: 'primary',
+        requestBody: {
+          summary: toolInput.titulo,
+          description: toolInput.descripcion || '',
+          start: { dateTime: toolInput.inicio, timeZone: 'Europe/Madrid' },
+          end: { dateTime: toolInput.fin, timeZone: 'Europe/Madrid' }
+        }
+      });
+      return `✅ Evento "${toolInput.titulo}" creado en el calendario.`;
+    }
+
+    if (toolName === 'drive_buscar') {
+      const auth = getGoogleAuth();
+      const drive = google.drive({ version: 'v3', auth });
+      const res = await drive.files.list({
+        q: `name contains '${toolInput.query}' and trashed = false`,
+        fields: 'files(id, name, mimeType, modifiedTime)',
+        pageSize: toolInput.max || 5
+      });
+      if (!res.data.files || res.data.files.length === 0) return 'No se encontraron archivos.';
+      return res.data.files.map(f => `📄 ${f.name}\n   ID: ${f.id}\n   Tipo: ${f.mimeType}\n   Modificado: ${f.modifiedTime}`).join('\n\n');
+    }
+
+    if (toolName === 'drive_leer') {
+      const auth = getGoogleAuth();
+      const drive = google.drive({ version: 'v3', auth });
+      // Exportar como texto plano (para Google Docs)
+      try {
+        const res = await drive.files.export({ fileId: toolInput.id, mimeType: 'text/plain' }, { responseType: 'text' });
+        return String(res.data).slice(0, 3000);
+      } catch {
+        // Para archivos no-Google (PDF, etc.), descarga directa
+        const res = await drive.files.get({ fileId: toolInput.id, alt: 'media' }, { responseType: 'text' });
+        return String(res.data).slice(0, 3000);
+      }
+    }
+
   } catch (e) {
     return `Error en ${toolName}: ${e.message}`;
   }
@@ -319,7 +523,7 @@ async function procesarCodigoMensaje(from, texto) {
       {
         model: 'claude-opus-4-5',
         max_tokens: 4096,
-        system: `Eres Claude Code, el asistente de programación personal de Ismael Romay, director de ISBEROAL. Tienes acceso a herramientas para leer y modificar el código del bot de WhatsApp que corre en Railway. El código está en /app. Cuando modifiques archivos, usa siempre git_push después para que Railway redespliegue automáticamente. Responde siempre en español. Sé conciso: ve al grano, no des explicaciones innecesarias.`,
+        system: `Eres el asistente personal de Ismael Romay, director de ISBEROAL (empresa de energía renovable en Galicia). Tienes acceso a herramientas para: (1) leer y modificar el código del bot de WhatsApp en /app y redesplegar vía git_push, (2) Gmail: buscar, leer y enviar emails, (3) Google Calendar: ver y crear eventos, (4) Google Drive: buscar y leer archivos. Usa las herramientas de forma autónoma para responder a lo que Ismael necesite. Responde siempre en español. Sé conciso y directo.`,
         tools: CLAUDE_CODE_TOOLS,
         messages: devSessions[from]
       },
