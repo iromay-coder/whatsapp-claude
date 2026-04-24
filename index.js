@@ -17,6 +17,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'iromay-coder/whatsapp-claude';
 const ISMAEL_NUMBER = process.env.ISMAEL_NUMBER || '34610870338';
+const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY;
 
 const conversaciones = {};
 const devSessions = {};
@@ -292,6 +293,43 @@ const CLAUDE_CODE_TOOLS = [
       },
       required: ['id']
     }
+  },
+  {
+    name: 'maps_buscar',
+    description: 'Busca un lugar en Google Maps',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Nombre o dirección del lugar' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'maps_ruta',
+    description: 'Calcula la ruta entre dos lugares',
+    input_schema: {
+      type: 'object',
+      properties: {
+        origen: { type: 'string', description: 'Lugar de origen' },
+        destino: { type: 'string', description: 'Lugar de destino' },
+        modo: { type: 'string', description: 'Modo de transporte: driving, walking, transit. Por defecto driving' }
+      },
+      required: ['origen', 'destino']
+    }
+  },
+  {
+    name: 'maps_cercanos',
+    description: 'Busca lugares cercanos a una ubicación',
+    input_schema: {
+      type: 'object',
+      properties: {
+        ubicacion: { type: 'string', description: 'Dirección o coordenadas del centro de búsqueda' },
+        tipo: { type: 'string', description: 'Tipo de lugar: restaurant, gas_station, hospital, etc.' },
+        radio: { type: 'number', description: 'Radio de búsqueda en metros, por defecto 1000' }
+      },
+      required: ['ubicacion', 'tipo']
+    }
   }
 ];
 
@@ -490,15 +528,64 @@ async function ejecutarHerramienta(from, toolName, toolInput) {
     if (toolName === 'drive_leer') {
       const auth = getGoogleAuth();
       const drive = google.drive({ version: 'v3', auth });
-      // Exportar como texto plano (para Google Docs)
       try {
         const res = await drive.files.export({ fileId: toolInput.id, mimeType: 'text/plain' }, { responseType: 'text' });
         return String(res.data).slice(0, 3000);
       } catch {
-        // Para archivos no-Google (PDF, etc.), descarga directa
         const res = await drive.files.get({ fileId: toolInput.id, alt: 'media' }, { responseType: 'text' });
         return String(res.data).slice(0, 3000);
       }
+    }
+
+    // ── Google Maps ───────────────────────────────────────────────────────────
+
+    if (toolName === 'maps_buscar') {
+      if (!GOOGLE_MAPS_KEY) return 'Error: GOOGLE_MAPS_KEY no configurado.';
+      const res = await axios.get('https://maps.googleapis.com/maps/api/place/textsearch/json', {
+        params: { query: toolInput.query, key: GOOGLE_MAPS_KEY, language: 'es' }
+      });
+      if (!res.data.results.length) return 'No se encontraron resultados.';
+      return res.data.results.slice(0, 3).map(p =>
+        `📍 ${p.name}\n   ${p.formatted_address}\n   ⭐ ${p.rating || 'sin valoración'}`
+      ).join('\n\n');
+    }
+
+    if (toolName === 'maps_ruta') {
+      if (!GOOGLE_MAPS_KEY) return 'Error: GOOGLE_MAPS_KEY no configurado.';
+      const res = await axios.get('https://maps.googleapis.com/maps/api/directions/json', {
+        params: {
+          origin: toolInput.origen,
+          destination: toolInput.destino,
+          mode: toolInput.modo || 'driving',
+          key: GOOGLE_MAPS_KEY,
+          language: 'es'
+        }
+      });
+      if (!res.data.routes.length) return 'No se encontró ruta.';
+      const ruta = res.data.routes[0].legs[0];
+      return `🗺️ ${toolInput.origen} → ${toolInput.destino}\n⏱️ ${ruta.duration.text}\n📏 ${ruta.distance.text}\n\nPasos:\n${ruta.steps.slice(0, 5).map(s => `• ${s.html_instructions.replace(/<[^>]+>/g, '')}`).join('\n')}`;
+    }
+
+    if (toolName === 'maps_cercanos') {
+      if (!GOOGLE_MAPS_KEY) return 'Error: GOOGLE_MAPS_KEY no configurado.';
+      const geocode = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
+        params: { address: toolInput.ubicacion, key: GOOGLE_MAPS_KEY }
+      });
+      if (!geocode.data.results.length) return 'No se pudo geolocalizar la ubicación.';
+      const loc = geocode.data.results[0].geometry.location;
+      const res = await axios.get('https://maps.googleapis.com/maps/api/place/nearbysearch/json', {
+        params: {
+          location: `${loc.lat},${loc.lng}`,
+          radius: toolInput.radio || 1000,
+          type: toolInput.tipo,
+          key: GOOGLE_MAPS_KEY,
+          language: 'es'
+        }
+      });
+      if (!res.data.results.length) return 'No se encontraron lugares cercanos.';
+      return res.data.results.slice(0, 5).map(p =>
+        `📍 ${p.name}\n   ${p.vicinity}\n   ⭐ ${p.rating || 'sin valoración'}`
+      ).join('\n\n');
     }
 
   } catch (e) {
@@ -647,5 +734,68 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Bot WhatsApp-Claude de ISBEROAL funcionando'));
 
+// ─── Memoria diaria en Drive ──────────────────────────────────────────────────
+
+async function guardarMemoriaEnDrive() {
+  try {
+    const auth = getGoogleAuth();
+    const drive = google.drive({ version: 'v3', auth });
+    const fecha = new Date().toISOString().split('T')[0];
+    const contenido = JSON.stringify({ fecha, sesiones: devSessions, conversaciones }, null, 2);
+    const nombreArchivo = `romay_bot_memoria_${fecha}.json`;
+
+    // Buscar si ya existe
+    const busqueda = await drive.files.list({
+      q: `name = '${nombreArchivo}' and trashed = false`,
+      fields: 'files(id)'
+    });
+
+    if (busqueda.data.files.length > 0) {
+      await drive.files.update({
+        fileId: busqueda.data.files[0].id,
+        media: { mimeType: 'application/json', body: contenido }
+      });
+    } else {
+      await drive.files.create({
+        requestBody: { name: nombreArchivo, mimeType: 'application/json' },
+        media: { mimeType: 'application/json', body: contenido }
+      });
+    }
+    console.log(`Memoria guardada en Drive: ${nombreArchivo}`);
+  } catch (e) {
+    console.error('Error guardando memoria en Drive:', e.message);
+  }
+}
+
+// ─── Mensajes programados ─────────────────────────────────────────────────────
+
+function programarMensajes() {
+  // Cada hora comprueba si toca enviar mensaje
+  setInterval(async () => {
+    const ahora = new Date();
+    const hora = ahora.toLocaleString('es-ES', { timeZone: 'Europe/Madrid', hour: '2-digit', minute: '2-digit' });
+    const [h, m] = hora.split(':').map(Number);
+
+    // Buenos días a las 8:00
+    if (h === 8 && m === 0) {
+      await enviarTexto(ISMAEL_NUMBER, '☀️ *Buenos días Ismael.* ¿Qué hacemos hoy?');
+    }
+
+    // Backup de memoria a medianoche
+    if (h === 0 && m === 0) {
+      await guardarMemoriaEnDrive();
+    }
+  }, 60 * 1000); // cada minuto
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Servidor corriendo en puerto ${PORT}`);
+  programarMensajes();
+  // Mensaje de buenas noches al arrancar (primera vez)
+  try {
+    await enviarTexto(ISMAEL_NUMBER, '🌙 Bot actualizado y listo. Mañana a las 8 te escribo. Buenas noches Ismael.');
+  } catch (e) {
+    console.error('Error enviando mensaje de inicio:', e.message);
+  }
+});
